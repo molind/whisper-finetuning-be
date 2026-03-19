@@ -29,9 +29,13 @@ python mlx_finetune_whisper.py \
     --freeze-encoder --batch-size 4 --iters 10000
 
 # Evaluation
-python run_eval_whisper_streaming.py <args>  # or use bash runners:
+python run_eval_whisper_streaming.py <args>  # PyTorch/HF models
+python mlx_eval_whisper.py --model ./output_mlx_small/final --dataset-dir /path/to/cv/be  # MLX models
 bash bash_runners/eval_cv11_test.sh   # Eval on CommonVoice11 test
 bash bash_runners/eval_fleurs_test.sh # Eval on Fleurs test
+
+# Live transcription (MLX)
+python live_transcribe.py --model ./output_mlx_small/final
 ```
 
 No formal test suite exists. Validation is done via debug training runs and evaluation scripts.
@@ -41,7 +45,9 @@ No formal test suite exists. Validation is done via debug training runs and eval
 **Entry points:**
 - `run_speech_recognition_seq2seq_streaming.py` — PyTorch training script. HuggingFace Seq2Seq pipeline with streaming dataset support. Configurable via CLI args or JSON config.
 - `mlx_finetune_whisper.py` — MLX training script for Apple Silicon. Reads CommonVoice data directly from local TSV/clips. ~5x faster than PyTorch on M-series Macs.
-- `run_eval_whisper_streaming.py` — Evaluation script. Computes WER, optionally saves predictions to Excel, can push results to HuggingFace Hub.
+- `run_eval_whisper_streaming.py` — PyTorch evaluation script. Computes WER, optionally saves predictions to Excel, can push results to HuggingFace Hub.
+- `mlx_eval_whisper.py` — MLX evaluation script. Computes WER on CommonVoice test set using BelarusianTextNormalizer.
+- `live_transcribe.py` — Live microphone transcription using MLX Whisper. VAD-based: detects speech segments, transcribes complete utterances.
 
 **Key modules:**
 - `custom_trainer.py` — `Seq2SeqTrainerCustomLinearScheduler`: extends HuggingFace's Seq2SeqTrainer with a custom linear LR scheduler that supports `learning_rate_end` and proper resume-from-checkpoint behavior.
