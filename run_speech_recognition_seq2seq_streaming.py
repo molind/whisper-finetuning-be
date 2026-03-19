@@ -47,7 +47,7 @@ from transformers import (
 )
 from transformers.trainer_pt_utils import IterableDatasetShard
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
-from transformers.utils import check_min_version, send_example_telemetry
+from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
 from belarusian_text_normalizer import BelarusianTextNormalizer
@@ -124,6 +124,12 @@ class ModelArguments:
             )
         },
     )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to trust remote code when loading datasets or models from the Hub."
+        },
+    )
     freeze_feature_encoder: bool = field(
         default=True,
         metadata={"help": "Whether to freeze the feature encoder layers of the model."},
@@ -164,6 +170,16 @@ class DataTrainingArguments:
         default=None,
         metadata={
             "help": "The configuration name of the dataset to use (via the datasets library)."
+        },
+    )
+    dataset_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a local Common Voice dataset directory (extracted tar.gz). "
+                "Should contain clips/ folder and TSV files (train.tsv, dev.tsv, test.tsv). "
+                "When set, dataset_name is ignored and data is loaded from local files."
+            )
         },
     )
     max_train_samples: Optional[int] = field(
@@ -311,6 +327,60 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         batch["labels"] = labels
 
         return batch
+
+
+def load_local_cv_dataset(dataset_dir, split="train"):
+    """
+    Load a Common Voice dataset from a local extracted tar.gz directory.
+    Expects: dataset_dir/clips/*.mp3 and dataset_dir/{train,dev,test}.tsv
+    Returns a HuggingFace IterableDataset that decodes audio on-the-fly.
+    """
+    import csv
+
+    # Map split names to TSV filenames
+    split_to_file = {
+        "train": "train.tsv",
+        "validation": "dev.tsv",
+        "dev": "dev.tsv",
+        "test": "test.tsv",
+    }
+
+    tsv_filename = split_to_file.get(split)
+    if tsv_filename is None:
+        raise ValueError(f"Unknown split '{split}'. Expected one of: {list(split_to_file.keys())}")
+
+    tsv_path = os.path.join(dataset_dir, tsv_filename)
+    if not os.path.exists(tsv_path):
+        raise FileNotFoundError(f"TSV file not found: {tsv_path}")
+
+    clips_dir = os.path.join(dataset_dir, "clips")
+    if not os.path.isdir(clips_dir):
+        raise FileNotFoundError(f"Clips directory not found: {clips_dir}")
+
+    # Read TSV to get paths and sentences
+    rows = []
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            audio_path = os.path.join(clips_dir, row["path"])
+            rows.append({"audio_path": audio_path, "sentence": row["sentence"]})
+
+    logger.info(f"Found {len(rows)} examples in {tsv_path}")
+
+    def generator():
+        import soundfile as sf
+        for row in rows:
+            try:
+                audio_array, sr = sf.read(row["audio_path"])
+                yield {
+                    "audio": {"array": audio_array, "sampling_rate": sr, "path": row["audio_path"]},
+                    "sentence": row["sentence"],
+                }
+            except Exception as e:
+                logger.warning(f"Skipping {row['audio_path']}: {e}")
+
+    ds = datasets.IterableDataset.from_generator(generator)
+    return ds
 
 
 def load_maybe_streaming_dataset(
@@ -480,42 +550,68 @@ def main():
 
     # TODO: replace dataset dicts with single key to IterableDataset and to Dataset.
     # don't know how to do it know - using dict simply because they work.
-    raw_train = IterableDatasetDict() if data_args.streaming_train else DatasetDict()
-    raw_eval = IterableDatasetDict() if data_args.streaming_eval else DatasetDict()
+    use_local = data_args.dataset_dir is not None
 
-    if training_args.do_train:
-        raw_train['train'] = load_maybe_streaming_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.train_split_name,
-            use_auth_token=True if model_args.use_auth_token else None,
-            streaming=data_args.streaming_train,
-        )
+    if use_local:
+        logger.info(f"Loading dataset from local directory: {data_args.dataset_dir}")
+        # Local loading returns IterableDataset to avoid OOM on large datasets
+        data_args.streaming_train = True
+        data_args.streaming_eval = True
+        raw_train = IterableDatasetDict()
+        raw_eval = IterableDatasetDict()
 
-    if training_args.do_eval:
-        raw_eval['eval'] = load_maybe_streaming_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=data_args.eval_split_name,
-            use_auth_token=True if model_args.use_auth_token else None,
-            streaming=data_args.streaming_eval,
-        )
+        if training_args.do_train:
+            raw_train['train'] = load_local_cv_dataset(
+                data_args.dataset_dir, split=data_args.train_split_name
+            )
 
-    raw_datasets_features = list(next(iter(raw_train.values())).features.keys())
+        if training_args.do_eval:
+            raw_eval['eval'] = load_local_cv_dataset(
+                data_args.dataset_dir, split=data_args.eval_split_name
+            )
+    else:
+        raw_train = IterableDatasetDict() if data_args.streaming_train else DatasetDict()
+        raw_eval = IterableDatasetDict() if data_args.streaming_eval else DatasetDict()
 
-    if data_args.audio_column_name not in raw_datasets_features:
-        raise ValueError(
-            f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
-            "Make sure to set `--audio_column_name` to the correct audio column - one of "
-            f"{', '.join(raw_datasets_features)}."
-        )
+        if training_args.do_train:
+            raw_train['train'] = load_maybe_streaming_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=data_args.train_split_name,
+                token=True if model_args.use_auth_token else None,
+                streaming=data_args.streaming_train,
+                trust_remote_code=model_args.trust_remote_code,
+            )
 
-    if data_args.text_column_name not in raw_datasets_features:
-        raise ValueError(
-            f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
-            "Make sure to set `--text_column_name` to the correct text column - one of "
-            f"{', '.join(raw_datasets_features)}."
-        )
+        if training_args.do_eval:
+            raw_eval['eval'] = load_maybe_streaming_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=data_args.eval_split_name,
+                token=True if model_args.use_auth_token else None,
+                streaming=data_args.streaming_eval,
+                trust_remote_code=model_args.trust_remote_code,
+            )
+
+    if use_local:
+        # Local datasets always have 'audio' and 'sentence' columns
+        raw_datasets_features = ["audio", "sentence"]
+    else:
+        raw_datasets_features = list(next(iter(raw_train.values())).features.keys())
+
+        if data_args.audio_column_name not in raw_datasets_features:
+            raise ValueError(
+                f"--audio_column_name '{data_args.audio_column_name}' not found in dataset '{data_args.dataset_name}'. "
+                "Make sure to set `--audio_column_name` to the correct audio column - one of "
+                f"{', '.join(raw_datasets_features)}."
+            )
+
+        if data_args.text_column_name not in raw_datasets_features:
+            raise ValueError(
+                f"--text_column_name {data_args.text_column_name} not found in dataset '{data_args.dataset_name}'. "
+                "Make sure to set `--text_column_name` to the correct text column - one of "
+                f"{', '.join(raw_datasets_features)}."
+            )
 
     # 5. Load pretrained model, tokenizer, and feature extractor
     #
@@ -525,7 +621,7 @@ def main():
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
 
     config.update(
@@ -546,21 +642,21 @@ def main():
         ),
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_args.model_name_or_path,
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=True if model_args.use_auth_token else None,
     )
 
     if model.config.decoder_start_token_id is None:
@@ -577,14 +673,16 @@ def main():
         tokenizer.set_prefix_tokens(language=data_args.language, task=data_args.task)
 
     # 6. Explicitly resample speech dataset
-    raw_train = raw_train.cast_column(
-        data_args.audio_column_name,
-        datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate, mono=True),
-    )
-    raw_eval = raw_eval.cast_column(
-        data_args.audio_column_name,
-        datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate, mono=True),
-    )
+    # For local datasets, resampling is handled in prepare_dataset via librosa
+    if not use_local:
+        raw_train = raw_train.cast_column(
+            data_args.audio_column_name,
+            datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate),
+        )
+        raw_eval = raw_eval.cast_column(
+            data_args.audio_column_name,
+            datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate),
+        )
 
     # 7. Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
@@ -615,13 +713,22 @@ def main():
             else raw_eval['eval'].select(range(data_args.max_eval_samples))
         )
 
+    target_sr = feature_extractor.sampling_rate
+
     def prepare_dataset(sample, labels_max_len: int = None):
         # process audio
         audio = sample[audio_column_name]
-        inputs = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"])
+        audio_array = audio["array"]
+        sr = audio["sampling_rate"]
+        # resample if needed (for local datasets where cast_column is not used)
+        if sr != target_sr:
+            import librosa
+            audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+        inputs = feature_extractor(audio_array, sampling_rate=sr)
         # process audio length
         sample[model_input_name] = inputs.get(model_input_name)[0]
-        sample["input_length"] = len(audio["array"])
+        sample["input_length"] = len(audio_array)
 
         # process targets
         input_str = sample[text_column_name].lower() if do_lower_case else sample[text_column_name]
@@ -784,7 +891,7 @@ def main():
         args=training_args,
         train_dataset=vectorized_train['train'] if training_args.do_train else None,
         eval_dataset=vectorized_eval['eval'] if training_args.do_eval else None,
-        tokenizer=processor,
+        processing_class=processor,
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
         callbacks=[ShuffleCallback()] if data_args.streaming_train else None,

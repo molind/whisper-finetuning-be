@@ -22,6 +22,9 @@ class Seq2SeqTrainerCustomLinearScheduler(Seq2SeqTrainer):
         return num_warmup_steps + (num_train_steps - num_warmup_steps) * lr_max / (lr_max - lr_end)
 
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        if optimizer is None:
+            optimizer = self.optimizer
+
         use_custom_scheduler = False
         try:
             # if learning_rate_end was passed as an argument
