@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Fine-tuning OpenAI's Whisper model for Belarusian speech recognition using HuggingFace Transformers. Published models: `ales/whisper-small-belarusian`, `ales/whisper-base-belarusian`. Dataset: CommonVoice 11.0 (Belarusian).
+Fine-tuning OpenAI's Whisper model for Belarusian speech recognition using HuggingFace Transformers and Apple MLX. Published models: `ales/whisper-small-belarusian`, `ales/whisper-base-belarusian`. Dataset: CommonVoice 24.0 (Belarusian).
 
 ## Commands
 
@@ -15,11 +15,18 @@ make venv-create          # Create Python 3.13+ venv
 make venv-install         # Install dependencies (uv sync)
 make server-install-system-deps  # Install ffmpeg, git-lfs, tmux
 
-# Training
+# Training (PyTorch — HuggingFace Trainer)
 python run_speech_recognition_seq2seq_streaming.py <args>  # or use bash runners:
 bash bash_runners/run_tiny_debug.sh   # Quick debug run (tiny model, 500 steps)
 bash bash_runners/run_small.sh        # Fine-tune small model
 bash bash_runners/run_base.sh         # Fine-tune base model
+
+# Training (MLX — Apple Silicon)
+python mlx_finetune_whisper.py <args>  # Requires mlx-whisper from ~/tmp/mlx-examples/whisper
+python mlx_finetune_whisper.py \
+    --model mlx-community/whisper-small-mlx \
+    --dataset-dir /path/to/cv-corpus/be \
+    --freeze-encoder --batch-size 4 --iters 10000
 
 # Evaluation
 python run_eval_whisper_streaming.py <args>  # or use bash runners:
@@ -32,24 +39,28 @@ No formal test suite exists. Validation is done via debug training runs and eval
 ## Architecture
 
 **Entry points:**
-- `run_speech_recognition_seq2seq_streaming.py` — Main training script. HuggingFace Seq2Seq pipeline with streaming dataset support. Configurable via CLI args or JSON config.
+- `run_speech_recognition_seq2seq_streaming.py` — PyTorch training script. HuggingFace Seq2Seq pipeline with streaming dataset support. Configurable via CLI args or JSON config.
+- `mlx_finetune_whisper.py` — MLX training script for Apple Silicon. Reads CommonVoice data directly from local TSV/clips. ~5x faster than PyTorch on M-series Macs.
 - `run_eval_whisper_streaming.py` — Evaluation script. Computes WER, optionally saves predictions to Excel, can push results to HuggingFace Hub.
 
 **Key modules:**
 - `custom_trainer.py` — `Seq2SeqTrainerCustomLinearScheduler`: extends HuggingFace's Seq2SeqTrainer with a custom linear LR scheduler that supports `learning_rate_end` and proper resume-from-checkpoint behavior.
 - `belarusian_text_normalizer.py` — `BelarusianTextNormalizer`: extends BasicTextNormalizer to preserve Belarusian-specific characters (apostrophe) during WER computation.
 
-**Data pipeline:** Raw audio → 16kHz resampling → Whisper feature extractor → tokenizer → `DataCollatorSpeechSeq2SeqWithPadding` (dynamic padding). Both training and evaluation support streaming mode for memory efficiency (`streaming_train`/`streaming_eval` flags).
+**Data pipeline (PyTorch):** Raw audio → 16kHz resampling → Whisper feature extractor → tokenizer → `DataCollatorSpeechSeq2SeqWithPadding` (dynamic padding). Both training and evaluation support streaming mode for memory efficiency (`streaming_train`/`streaming_eval` flags).
+
+**Data pipeline (MLX):** Local MP3 clips → `load_audio` (16kHz) → `pad_or_trim` (30s) → `log_mel_spectrogram` → tokenizer (SOT + language + task + text + EOT). Reads directly from CommonVoice TSV files, no HuggingFace datasets dependency.
 
 **Logging:** TensorBoard (migration to MLflow planned). Experiment tracking via HuggingFace Hub.
 
 ## Key Design Decisions
 
-- **Streaming mode** is default for training to handle large datasets without full download.
-- **Checkpoint resume** is automatic — the trainer detects existing checkpoints in output_dir.
+- **Streaming mode** is default for PyTorch training to handle large datasets without full download.
+- **Checkpoint resume** is automatic — the PyTorch trainer detects existing checkpoints in output_dir. MLX script supports `--resume latest` or `--resume <path>` to continue from a checkpoint (saves model weights, optimizer state, and iteration number).
 - **WER metric** is the primary evaluation metric; best model is saved based on it.
 - All audio is resampled to 16kHz (Whisper requirement).
 - Whisper's 30-second window limitation requires special handling for longer utterances (see README for details on chunking/striding and hallucination mitigation).
+- **MLX float32 casting** — MLX whisper models from `mlx-community` store weights as float16 in safetensors. `load_model(dtype=mx.float32)` does not cast them, so explicit casting after load is required to prevent AdamW overflow → NaN loss.
 
 ## Package Management
 
