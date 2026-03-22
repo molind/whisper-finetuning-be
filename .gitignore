@@ -3,3 +3,6 @@
 .env
 .DS_Store
 uv.lock
+__pycache__/
+nemo_models/
+output_mlx_*/
