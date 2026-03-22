@@ -24,7 +24,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 # Add mlx-whisper to path
 import sys
@@ -300,30 +300,57 @@ def train(args):
     n_tokens = 0
     train_time = 0.0
 
+    accum_steps = args.grad_accumulation
+    micro_batch = args.batch_size
+    effective_batch = micro_batch * accum_steps
+
     print(f"\nStarting training for {args.iters} iterations (from iter {start_iter})...")
-    print(f"Batch size: {args.batch_size}, LR: {args.learning_rate}")
+    print(f"Batch size: {effective_batch} ({micro_batch}x{accum_steps} accum), LR: {args.learning_rate}")
 
     for it in range(start_iter, args.iters + 1):
         tic = time.perf_counter()
 
-        # Get batch
-        if sample_idx + args.batch_size > len(train_samples):
-            np.random.shuffle(train_samples)
-            sample_idx = 0
-        batch = train_samples[sample_idx : sample_idx + args.batch_size]
-        sample_idx += args.batch_size
+        accumulated_grad = None
+        step_loss = 0.0
+        step_ntoks = 0
 
-        mel, decoder_input, targets, lengths = prepare_batch(batch, tokenizer, n_mels)
-        if mel is None:
+        for accum_step in range(accum_steps):
+            # Get micro-batch
+            if sample_idx + micro_batch > len(train_samples):
+                np.random.shuffle(train_samples)
+                sample_idx = 0
+            batch = train_samples[sample_idx : sample_idx + micro_batch]
+            sample_idx += micro_batch
+
+            mel, decoder_input, targets, lengths = prepare_batch(batch, tokenizer, n_mels)
+            if mel is None:
+                continue
+
+            # Forward + backward
+            (loss, ntoks), grad = loss_and_grad(model, mel, decoder_input, targets, lengths)
+            mx.eval(loss, ntoks)
+            step_loss += loss.item()
+            step_ntoks += ntoks.item()
+
+            # Accumulate gradients
+            if accumulated_grad is None:
+                accumulated_grad = grad
+            else:
+                accumulated_grad = tree_map(lambda a, b: a + b, accumulated_grad, grad)
+
+        if accumulated_grad is None:
             continue
 
-        # Forward + backward + update
-        (loss, ntoks), grad = loss_and_grad(model, mel, decoder_input, targets, lengths)
-        optimizer.update(model, grad)
-        mx.eval(model.parameters(), optimizer.state, loss, ntoks)
+        # Average gradients and update
+        accumulated_grad = tree_map(lambda g: g * (1.0 / accum_steps), accumulated_grad)
+        optimizer.update(model, accumulated_grad)
+        mx.eval(model.parameters(), optimizer.state)
 
-        losses += loss.item()
-        n_tokens += ntoks.item()
+        loss_val = step_loss / accum_steps
+        ntoks_val = step_ntoks
+
+        losses += loss_val
+        n_tokens += ntoks_val
         train_time += time.perf_counter() - tic
 
         # Log
@@ -381,6 +408,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--val-batches", type=int, default=10)
+    parser.add_argument("--grad-accumulation", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch-size * grad-accumulation)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path, or 'latest' to auto-detect")
