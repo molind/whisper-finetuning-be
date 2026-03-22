@@ -357,6 +357,124 @@ class ConformerCTC(nn.Module):
         return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
 
+# ─── Conformer-Transducer (RNN-T) ───────────────────────────────────────────
+
+class LSTMCell:
+    """Single LSTM cell for step-by-step inference."""
+
+    def __init__(self, input_size, hidden_size):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih = None  # (4*hidden, input)
+        self.weight_hh = None  # (4*hidden, hidden)
+        self.bias_ih = None    # (4*hidden,)
+        self.bias_hh = None    # (4*hidden,)
+
+    def __call__(self, x, state):
+        """x: (batch, input_size), state: (h, c) each (batch, hidden_size)."""
+        h, c = state
+        gates = x @ self.weight_ih.T + self.bias_ih + h @ self.weight_hh.T + self.bias_hh
+        i, f, g, o = mx.split(gates, 4, axis=-1)
+        i = mx.sigmoid(i)
+        f = mx.sigmoid(f)
+        g = mx.tanh(g)
+        o = mx.sigmoid(o)
+        c_new = f * c + i * g
+        h_new = o * mx.tanh(c_new)
+        return h_new, c_new
+
+
+class ConformerTransducer(nn.Module):
+    """Full Conformer-Transducer (RNN-T) model."""
+
+    def __init__(self, n_layers=17, d_model=512, n_heads=8, feat_in=80,
+                 conv_kernel_size=31, ff_expansion=4,
+                 pred_hidden=640, vocab_size=1025):
+        super().__init__()
+        self.d_model = d_model
+        self.pred_hidden = pred_hidden
+        self.vocab_size = vocab_size
+
+        # Encoder (same as CTC)
+        self.subsampling = ConvSubsampling(d_model, feat_in)
+        self.layers = [
+            ConformerBlock(d_model, n_heads, conv_kernel_size, ff_expansion)
+            for _ in range(n_layers)
+        ]
+
+        # Prediction network (LSTM)
+        self.embed = None        # (vocab_size, pred_hidden)
+        self.lstm = LSTMCell(pred_hidden, pred_hidden)
+
+        # Joint network
+        self.joint_enc = nn.Linear(d_model, pred_hidden)
+        self.joint_pred = nn.Linear(pred_hidden, pred_hidden)
+        self.joint_out = nn.Linear(pred_hidden, vocab_size)
+
+    def encode(self, mel):
+        """Run encoder on mel spectrogram."""
+        x = self.subsampling(mel) * (self.d_model ** 0.5)
+        T = x.shape[1]
+        pos_emb = RelPositionalEncoding.get_encoding(T, self.d_model)
+        for layer in self.layers:
+            x = layer(x, pos_emb)
+        return x
+
+    def predict_step(self, token, state):
+        """Single prediction network step."""
+        emb = self.embed[token]  # (batch, pred_hidden)
+        h, c = self.lstm(emb, state)
+        return h, (h, c)
+
+    def joint(self, enc_out, pred_out):
+        """Joint network: combine encoder and prediction outputs."""
+        j = self.joint_enc(enc_out) + self.joint_pred(pred_out)
+        j = nn.relu(j)
+        return self.joint_out(j)
+
+    def greedy_decode(self, mel, max_symbols_per_step=10):
+        """Greedy RNN-T decoding."""
+        enc = self.encode(mel)
+        mx.eval(enc)
+        B, T, _ = enc.shape
+
+        # Initial state
+        blank_id = self.vocab_size - 1
+        h = mx.zeros((B, self.pred_hidden))
+        c = mx.zeros((B, self.pred_hidden))
+        token = mx.full((B,), blank_id, dtype=mx.int32)
+
+        all_tokens = []
+
+        for t in range(T):
+            enc_t = enc[:, t, :]  # (B, d_model)
+            for _ in range(max_symbols_per_step):
+                pred_out, (h_new, c_new) = self.predict_step(token, (h, c))
+                logits = self.joint(enc_t, pred_out)
+                mx.eval(logits)
+                y = mx.argmax(logits, axis=-1)  # (B,)
+                y_val = y.item()
+
+                if y_val == blank_id:
+                    break
+                all_tokens.append(y_val)
+                token = y
+                h, c = h_new, c_new
+
+        return all_tokens
+
+
+def transducer_greedy_decode(tokens, vocabulary):
+    """Convert token IDs to text using vocabulary."""
+    text = ""
+    for t in tokens:
+        if t < len(vocabulary):
+            piece = vocabulary[t]
+            piece = piece.replace("▁", " ")
+            text += piece
+    return text.strip()
+
+
 # ─── Weight Loading ─────────────────────────────────────────────────────────
 
 def load_nemo_ctc(model_dir):
@@ -437,6 +555,85 @@ def load_nemo_ctc(model_dir):
     return model
 
 
+def load_nemo_transducer(model_dir):
+    """Load NeMo Transducer model weights into MLX ConformerTransducer."""
+    import torch
+
+    model_dir = Path(model_dir)
+    weights = torch.load(model_dir / "model_weights.ckpt", map_location="cpu", weights_only=False)
+
+    model = ConformerTransducer(n_layers=17)
+
+    # Conv subsampling (same as CTC)
+    model.subsampling.conv1_weight = mx.array(weights["encoder.pre_encode.conv.0.weight"].numpy())
+    model.subsampling.conv1_bias = mx.array(weights["encoder.pre_encode.conv.0.bias"].numpy())
+    model.subsampling.conv2_weight = mx.array(weights["encoder.pre_encode.conv.2.weight"].numpy())
+    model.subsampling.conv2_bias = mx.array(weights["encoder.pre_encode.conv.2.bias"].numpy())
+    model.subsampling.out.weight = mx.array(weights["encoder.pre_encode.out.weight"].numpy())
+    model.subsampling.out.bias = mx.array(weights["encoder.pre_encode.out.bias"].numpy())
+
+    # Conformer layers (same loading as CTC)
+    for i, layer in enumerate(model.layers):
+        prefix = f"encoder.layers.{i}"
+        layer.norm_feed_forward1.weight = mx.array(weights[f"{prefix}.norm_feed_forward1.weight"].numpy())
+        layer.norm_feed_forward1.bias = mx.array(weights[f"{prefix}.norm_feed_forward1.bias"].numpy())
+        layer.feed_forward1.linear1.weight = mx.array(weights[f"{prefix}.feed_forward1.linear1.weight"].numpy())
+        layer.feed_forward1.linear1.bias = mx.array(weights[f"{prefix}.feed_forward1.linear1.bias"].numpy())
+        layer.feed_forward1.linear2.weight = mx.array(weights[f"{prefix}.feed_forward1.linear2.weight"].numpy())
+        layer.feed_forward1.linear2.bias = mx.array(weights[f"{prefix}.feed_forward1.linear2.bias"].numpy())
+        layer.norm_self_att.weight = mx.array(weights[f"{prefix}.norm_self_att.weight"].numpy())
+        layer.norm_self_att.bias = mx.array(weights[f"{prefix}.norm_self_att.bias"].numpy())
+        layer.self_attn.linear_q.weight = mx.array(weights[f"{prefix}.self_attn.linear_q.weight"].numpy())
+        layer.self_attn.linear_q.bias = mx.array(weights[f"{prefix}.self_attn.linear_q.bias"].numpy())
+        layer.self_attn.linear_k.weight = mx.array(weights[f"{prefix}.self_attn.linear_k.weight"].numpy())
+        layer.self_attn.linear_k.bias = mx.array(weights[f"{prefix}.self_attn.linear_k.bias"].numpy())
+        layer.self_attn.linear_v.weight = mx.array(weights[f"{prefix}.self_attn.linear_v.weight"].numpy())
+        layer.self_attn.linear_v.bias = mx.array(weights[f"{prefix}.self_attn.linear_v.bias"].numpy())
+        layer.self_attn.linear_out.weight = mx.array(weights[f"{prefix}.self_attn.linear_out.weight"].numpy())
+        layer.self_attn.linear_out.bias = mx.array(weights[f"{prefix}.self_attn.linear_out.bias"].numpy())
+        layer.self_attn.linear_pos.weight = mx.array(weights[f"{prefix}.self_attn.linear_pos.weight"].numpy())
+        layer.self_attn.pos_bias_u = mx.array(weights[f"{prefix}.self_attn.pos_bias_u"].numpy())
+        layer.self_attn.pos_bias_v = mx.array(weights[f"{prefix}.self_attn.pos_bias_v"].numpy())
+        layer.norm_conv.weight = mx.array(weights[f"{prefix}.norm_conv.weight"].numpy())
+        layer.norm_conv.bias = mx.array(weights[f"{prefix}.norm_conv.bias"].numpy())
+        layer.conv.pointwise_conv1_weight = mx.array(weights[f"{prefix}.conv.pointwise_conv1.weight"].numpy())
+        layer.conv.pointwise_conv1_bias = mx.array(weights[f"{prefix}.conv.pointwise_conv1.bias"].numpy())
+        layer.conv.depthwise_conv_weight = mx.array(weights[f"{prefix}.conv.depthwise_conv.weight"].numpy())
+        layer.conv.depthwise_conv_bias = mx.array(weights[f"{prefix}.conv.depthwise_conv.bias"].numpy())
+        layer.conv.batch_norm_weight = mx.array(weights[f"{prefix}.conv.batch_norm.weight"].numpy())
+        layer.conv.batch_norm_bias = mx.array(weights[f"{prefix}.conv.batch_norm.bias"].numpy())
+        layer.conv.batch_norm_running_mean = mx.array(weights[f"{prefix}.conv.batch_norm.running_mean"].numpy())
+        layer.conv.batch_norm_running_var = mx.array(weights[f"{prefix}.conv.batch_norm.running_var"].numpy())
+        layer.conv.pointwise_conv2_weight = mx.array(weights[f"{prefix}.conv.pointwise_conv2.weight"].numpy())
+        layer.conv.pointwise_conv2_bias = mx.array(weights[f"{prefix}.conv.pointwise_conv2.bias"].numpy())
+        layer.norm_feed_forward2.weight = mx.array(weights[f"{prefix}.norm_feed_forward2.weight"].numpy())
+        layer.norm_feed_forward2.bias = mx.array(weights[f"{prefix}.norm_feed_forward2.bias"].numpy())
+        layer.feed_forward2.linear1.weight = mx.array(weights[f"{prefix}.feed_forward2.linear1.weight"].numpy())
+        layer.feed_forward2.linear1.bias = mx.array(weights[f"{prefix}.feed_forward2.linear1.bias"].numpy())
+        layer.feed_forward2.linear2.weight = mx.array(weights[f"{prefix}.feed_forward2.linear2.weight"].numpy())
+        layer.feed_forward2.linear2.bias = mx.array(weights[f"{prefix}.feed_forward2.linear2.bias"].numpy())
+        layer.norm_out.weight = mx.array(weights[f"{prefix}.norm_out.weight"].numpy())
+        layer.norm_out.bias = mx.array(weights[f"{prefix}.norm_out.bias"].numpy())
+
+    # Prediction network (LSTM)
+    model.embed = mx.array(weights["decoder.prediction.embed.weight"].numpy())
+    model.lstm.weight_ih = mx.array(weights["decoder.prediction.dec_rnn.lstm.weight_ih_l0"].numpy())
+    model.lstm.weight_hh = mx.array(weights["decoder.prediction.dec_rnn.lstm.weight_hh_l0"].numpy())
+    model.lstm.bias_ih = mx.array(weights["decoder.prediction.dec_rnn.lstm.bias_ih_l0"].numpy())
+    model.lstm.bias_hh = mx.array(weights["decoder.prediction.dec_rnn.lstm.bias_hh_l0"].numpy())
+
+    # Joint network
+    model.joint_enc.weight = mx.array(weights["joint.enc.weight"].numpy())
+    model.joint_enc.bias = mx.array(weights["joint.enc.bias"].numpy())
+    model.joint_pred.weight = mx.array(weights["joint.pred.weight"].numpy())
+    model.joint_pred.bias = mx.array(weights["joint.pred.bias"].numpy())
+    model.joint_out.weight = mx.array(weights["joint.joint_net.2.weight"].numpy())
+    model.joint_out.bias = mx.array(weights["joint.joint_net.2.bias"].numpy())
+
+    mx.eval(model.parameters())
+    return model
+
+
 # ─── CTC Greedy Decode ──────────────────────────────────────────────────────
 
 def ctc_greedy_decode(log_probs, vocabulary):
@@ -466,11 +663,25 @@ def ctc_greedy_decode(log_probs, vocabulary):
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 def load_vocabulary(model_dir):
-    """Load vocabulary from NeMo config."""
+    """Load vocabulary from NeMo config or SentencePiece vocab file."""
     import yaml
-    with open(Path(model_dir) / "model_config.yaml") as f:
+    model_dir = Path(model_dir)
+    with open(model_dir / "model_config.yaml") as f:
         config = yaml.safe_load(f)
-    return config["decoder"]["vocabulary"]
+
+    # CTC model has vocab in decoder.vocabulary
+    if "vocabulary" in config.get("decoder", {}):
+        return config["decoder"]["vocabulary"]
+
+    # Transducer uses SentencePiece tokenizer
+    spe_files = list(model_dir.glob("*_tokenizer_*.model"))
+    if spe_files:
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.Load(str(spe_files[0]))
+        return [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
+
+    return []
 
 
 def load_audio_file(path):
@@ -485,27 +696,37 @@ def load_audio_file(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MLX Conformer-CTC inference")
+    parser = argparse.ArgumentParser(description="MLX Conformer inference")
     parser.add_argument("--model", type=str, default="nemo_models/ctc_extracted")
+    parser.add_argument("--type", type=str, default="ctc", choices=["ctc", "transducer"])
     parser.add_argument("--audio", type=str, help="Audio file to transcribe")
     parser.add_argument("--eval", action="store_true", help="Run WER evaluation")
     parser.add_argument("--dataset-dir", type=str)
     parser.add_argument("--max-samples", type=int, default=0)
     args = parser.parse_args()
 
-    print(f"Loading model from: {args.model}")
-    model = load_nemo_ctc(args.model)
+    print(f"Loading {args.type} model from: {args.model}")
+    if args.type == "ctc":
+        model = load_nemo_ctc(args.model)
+    else:
+        model = load_nemo_transducer(args.model)
     vocabulary = load_vocabulary(args.model)
-    print(f"Model loaded. {len(vocabulary)} vocab tokens, 18 Conformer layers")
+    print(f"Model loaded. {len(vocabulary)} vocab tokens")
+
+    def transcribe_audio(audio):
+        mel = compute_mel_spectrogram(audio)
+        mel = mx.expand_dims(mel, axis=0)
+        if args.type == "ctc":
+            log_probs = model(mel)
+            mx.eval(log_probs)
+            return ctc_greedy_decode(log_probs[0], vocabulary)
+        else:
+            tokens = model.greedy_decode(mel)
+            return transducer_greedy_decode(tokens, vocabulary)
 
     if args.audio:
         audio = load_audio_file(args.audio)
-        mel = compute_mel_spectrogram(audio)
-        mel = mx.expand_dims(mel, axis=0)  # add batch dim
-
-        log_probs = model(mel)
-        mx.eval(log_probs)
-        text = ctc_greedy_decode(log_probs[0], vocabulary)
+        text = transcribe_audio(audio)
         print(f"\nTranscription: {text}")
 
     elif args.eval:
@@ -534,11 +755,7 @@ def main():
         for i, (audio_path, ref) in enumerate(samples):
             try:
                 audio = load_audio_file(audio_path)
-                mel = compute_mel_spectrogram(audio)
-                mel = mx.expand_dims(mel, axis=0)
-                log_probs = model(mel)
-                mx.eval(log_probs)
-                text = ctc_greedy_decode(log_probs[0], vocabulary)
+                text = transcribe_audio(audio)
             except Exception as e:
                 continue
 
